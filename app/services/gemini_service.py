@@ -1,43 +1,34 @@
-from flask import Flask, render_template, request, jsonify
 import os
+import logging
 import google.generativeai as genai
 
-app = Flask(__name__)
-
-# Configure a secret key for session management (optional, but good practice)
-app.config['SECRET_KEY'] = os.urandom(24)
-
 # Configure Gemini API Key
-GEMINI_API_KEY = "AIzaSyB3X2-gyRMUPTo1jM2KCn5PLXtgy1L72Oc"
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 if not GEMINI_API_KEY:
-    print("Warning: GEMINI_API_KEY environment variable not set.")
-    # Potentially raise an error or use a default/test key if appropriate
+    logging.warning("Warning: GEMINI_API_KEY environment variable not set.")
 else:
     genai.configure(api_key=GEMINI_API_KEY)
 
-@app.route('/')
-def index():
-    """Serves the main HTML page."""
-    return render_template('index.html')
+def analyze_transcript(transcript, sales_rep_names, merchant_names):
+    """
+    Analyzes a transcript using Gemini AI.
+    
+    Args:
+        transcript (str): The transcript to analyze
+        sales_rep_names (str): Names of sales representatives
+        merchant_names (str): Names of merchants
+        
+    Returns:
+        dict: Analysis results or error message
+    """
+    try:
+        # Check if API key is configured before making API call 
+        if not GEMINI_API_KEY:
+            logging.error("Gemini API key not configured.")
+            return {'error': 'AI service not configured. API key is missing.'}
 
-@app.route('/analyze', methods=['POST'])
-def analyze_transcript():
-    """Receives transcript data and speaker roles, calls Gemini API."""
-    if request.method == 'POST':
-        try:
-            data = request.get_json()
-            transcript = data.get('transcript')
-            sales_rep_names = data.get('sales_rep_names')
-            merchant_names = data.get('merchant_names', 'Customer')  # Default to 'Customer' if not provided
-
-            if not transcript:
-                return jsonify({'error': 'No transcript provided.'}), 400
-            if not sales_rep_names:
-                return jsonify({'error': 'Sales Rep name(s) not provided.'}), 400
-
-            # Construct the prompt for Gemini
-            # Using f-string with triple quotes for multi-line string
-            prompt = f"""# Funnel‑Coach‑Gem v1‑2025‑05‑21 (Rev 7)‑explore‑100pt (Explore‑stage calls)
+        # Construct the prompt for Gemini
+        prompt = f"""# Funnel‑Coach‑Gem v1‑2025‑05‑21 (Rev 7)‑explore‑100pt (Explore‑stage calls)
 
 ## ROLE
 
@@ -332,48 +323,37 @@ Merchant(s) indicated as: {merchant_names}
 
 """
 
-            # Check if API key is configured before making API call 
-            if not GEMINI_API_KEY:
-                app.logger.error("Gemini API key not configured.")
-                return jsonify({'error': 'AI service not configured. API key is missing.'}), 500
-
-            # Use the experimental model with a very low temperature (0.01) for highly consistent outputs
-            model = genai.GenerativeModel('gemini-2.5-flash-preview-05-20', 
-                                         generation_config=genai.GenerationConfig(
-                                             temperature=0,
-                                             top_p=0.1  # Added top_p parameter set to 0.2
-                                         ))
+        # Use the experimental model with a very low temperature
+        model = genai.GenerativeModel('gemini-2.5-flash-preview-05-20', 
+                                    generation_config=genai.GenerationConfig(
+                                        temperature=0,
+                                        top_p=0.1
+                                    ))
+        
+        # Make the API call
+        response = model.generate_content(prompt)
+        
+        # Handle specific error responses
+        if response.text == "NEED_SPEAKER_ROLES: Please specify which speaker(s) is/are the sales rep(s) and which is/are the merchant(s) so I can evaluate the call.":
+            return {'analysis_text': response.text, 'is_error': True}
+        elif response.text == "DATA_NOT_REDACTED":
+            return {'analysis_text': response.text, 'is_error': True}
+        elif response.text == "UNSUPPORTED_INPUT":
+            return {'analysis_text': response.text, 'is_error': True}
+        
+        # Check for empty response
+        if not hasattr(response, 'text') or not response.text:
+            logging.error(f"Gemini API returned an empty or malformed response: {response}")
+            prompt_feedback_msg = ""
+            if hasattr(response, 'prompt_feedback') and response.prompt_feedback and hasattr(response.prompt_feedback, 'block_reason'):
+                prompt_feedback_msg = f" (Reason: {response.prompt_feedback.block_reason_message})"
+            return {'error': f'AI service returned no content.{prompt_feedback_msg}'}
             
-            # Make the API call
-            response = model.generate_content(prompt)
-            
-            # The response from Gemini should be plain text as per instructions
-            # Check for specific error strings the model might return based on instructions
-            if response.text == "NEED_SPEAKER_ROLES: Please specify which speaker(s) is/are the sales rep(s) and which is/are the merchant(s) so I can evaluate the call.":
-                return jsonify({'analysis_text': response.text, 'is_error': True})
-            elif response.text == "DATA_NOT_REDACTED":
-                return jsonify({'analysis_text': response.text, 'is_error': True})
-            elif response.text == "UNSUPPORTED_INPUT":
-                return jsonify({'analysis_text': response.text, 'is_error': True})
-            
-            # Check if there's content in the response
-            if not hasattr(response, 'text') or not response.text:
-                app.logger.error(f"Gemini API returned an empty or malformed response: {response}")
-                # Check for prompt feedback if available
-                prompt_feedback_msg = ""
-                if hasattr(response, 'prompt_feedback') and response.prompt_feedback and hasattr(response.prompt_feedback, 'block_reason'):
-                    prompt_feedback_msg = f" (Reason: {response.prompt_feedback.block_reason_message})"
-                return jsonify({'error': f'AI service returned no content.{prompt_feedback_msg}'}), 500
-
-            return jsonify({'analysis_text': response.text})
-
-        except Exception as e:
-            app.logger.error(f"Error processing request: {e}")
-            # Check if it's a Google API error for more specific feedback
-            if hasattr(e, 'args') and e.args and isinstance(e.args[0], str) and "API key not valid" in e.args[0]:
-                 return jsonify({'error': 'Invalid Gemini API Key. Please check your configuration.'}), 500
-            return jsonify({'error': f'An error occurred processing your request: {str(e)}'}), 500
-
-if __name__ == '__main__':
-    # Note: Debug mode should be False in a production environment
-    app.run(debug=True, host='0.0.0.0') 
+        # Return successful response
+        return {'analysis_text': response.text}
+    except Exception as e:
+        logging.error(f"Error processing request: {e}")
+        # Check if it's a Google API error for more specific feedback
+        if hasattr(e, 'args') and e.args and isinstance(e.args[0], str) and "API key not valid" in e.args[0]:
+             return {'error': 'Invalid Gemini API Key. Please check your configuration.'}
+        return {'error': f'An error occurred processing your request: {str(e)}'}
