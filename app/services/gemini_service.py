@@ -1,6 +1,9 @@
 import os
 import logging
 import google.generativeai as genai
+import gc  # For garbage collection
+import functools
+import time
 
 # Configure Gemini API Key
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
@@ -9,6 +12,27 @@ if not GEMINI_API_KEY:
 else:
     genai.configure(api_key=GEMINI_API_KEY)
 
+# Retry decorator for API calls
+def retry_api_call(max_retries=3, backoff_factor=1.0):
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            retries = 0
+            while retries < max_retries:
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    retries += 1
+                    if retries >= max_retries:
+                        raise
+                    logging.warning(f"API call failed, retrying ({retries}/{max_retries}): {e}")
+                    # Exponential backoff
+                    time.sleep(backoff_factor * (2 ** (retries - 1)))
+            return None  # Should never reach here
+        return wrapper
+    return decorator
+
+@retry_api_call(max_retries=2)
 def analyze_transcript(transcript, sales_rep_names, merchant_names):
     """
     Analyzes a transcript using Gemini AI.
@@ -27,7 +51,7 @@ def analyze_transcript(transcript, sales_rep_names, merchant_names):
             logging.error("Gemini API key not configured.")
             return {'error': 'AI service not configured. API key is missing.'}
 
-        # Construct the prompt for Gemini
+        # Construct the prompt for Gemini, keeping everything else the same
         prompt = f"""# Funnel‑Coach‑Gem v1‑2025‑05‑21 (Rev 7)‑explore‑100pt (Explore‑stage calls)
 
 ## ROLE
@@ -323,15 +347,31 @@ Merchant(s) indicated as: {merchant_names}
 
 """
 
-        # Use the experimental model with a very low temperature
+        # Use a more optimized model configuration with lower temperature for memory efficiency
         model = genai.GenerativeModel('gemini-2.5-flash-preview-05-20', 
                                     generation_config=genai.GenerationConfig(
                                         temperature=0,
-                                        top_p=0.1
+                                        top_p=0.1,
+                                        max_output_tokens=10000  # Limit output size
                                     ))
         
-        # Make the API call
-        response = model.generate_content(prompt)
+        # Make the API call with retry
+        try:
+            response = model.generate_content(prompt)
+        except Exception as e:
+            logging.error(f"First API call failed, retrying: {e}")
+            # Clean up memory before retrying
+            gc.collect()
+            # Retry with a shorter prompt if needed
+            if len(transcript) > 50000:
+                transcript = transcript[:50000] + "\n...[transcript truncated due to length]"
+                prompt = prompt.replace("{transcript}", transcript)
+            # Try again with a delay
+            time.sleep(1)
+            response = model.generate_content(prompt)
+        
+        # Force garbage collection to free memory
+        gc.collect()
         
         # Handle specific error responses
         if response.text == "NEED_SPEAKER_ROLES: Please specify which speaker(s) is/are the sales rep(s) and which is/are the merchant(s) so I can evaluate the call.":
@@ -353,6 +393,8 @@ Merchant(s) indicated as: {merchant_names}
         return {'analysis_text': response.text}
     except Exception as e:
         logging.error(f"Error processing request: {e}")
+        # Clean up memory
+        gc.collect()
         # Check if it's a Google API error for more specific feedback
         if hasattr(e, 'args') and e.args and isinstance(e.args[0], str) and "API key not valid" in e.args[0]:
              return {'error': 'Invalid Gemini API Key. Please check your configuration.'}
