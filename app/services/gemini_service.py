@@ -219,14 +219,14 @@ Keep your response concise and under 2000 words.
         # Make the API call with retry and timeout protection
         try:
             # Set a timeout for the entire operation
-            with time_limit(60):  # 60 second timeout
+            with time_limit(300):  # 5 minute timeout
                 # Force garbage collection before API call
                 gc.collect()
                 response = model.generate_content(prompt)
                 # Force garbage collection immediately after API call
                 gc.collect()
         except TimeoutException:
-            logging.error("Gemini API call timed out after 60 seconds")
+            logging.error("Gemini API call timed out after 5 minutes")
             return {'error': 'Analysis timed out. Please try with a shorter transcript.'}
         except Exception as e:
             logging.error(f"First API call failed, retrying: {e}")
@@ -240,7 +240,7 @@ Keep your response concise and under 2000 words.
             time.sleep(1)
             
             try:
-                with time_limit(60):  # 60 second timeout for retry
+                with time_limit(300):  # 5 minute timeout for retry
                     response = model.generate_content(prompt)
                     gc.collect()
             except TimeoutException:

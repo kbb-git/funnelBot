@@ -78,7 +78,7 @@ document.addEventListener('DOMContentLoaded', () => {
         try {
             // Set a timeout to handle cases where the server doesn't respond
             const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 180000); // 3 minute timeout
+            const timeoutId = setTimeout(() => controller.abort(), 600000); // 10 minute timeout
 
             const response = await fetch('/analyze', {
                 method: 'POST',
@@ -94,7 +94,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 signal: controller.signal
             }).catch(error => {
                 if (error.name === 'AbortError') {
-                    throw new Error('Request timed out after 3 minutes. The transcript may be too large or the server is busy.');
+                    throw new Error('Request timed out after 10 minutes. The transcript may be too large or the server is busy.');
                 }
                 throw error;
             });
