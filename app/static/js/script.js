@@ -76,29 +76,53 @@ document.addEventListener('DOMContentLoaded', () => {
         loadingIndicator.scrollIntoView({ behavior: 'smooth' });
 
         try {
+            // Set a timeout to handle cases where the server doesn't respond
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 180000); // 3 minute timeout
+
             const response = await fetch('/analyze', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
+                    'Accept': 'application/json'
                 },
                 body: JSON.stringify({
                     transcript: transcript,
                     sales_rep_names: salesRepNames,
                     merchant_names: merchantNames
                 }),
+                signal: controller.signal
+            }).catch(error => {
+                if (error.name === 'AbortError') {
+                    throw new Error('Request timed out after 3 minutes. The transcript may be too large or the server is busy.');
+                }
+                throw error;
             });
+
+            // Clear the timeout
+            clearTimeout(timeoutId);
 
             // Stop loading indicators regardless of response status
             stopCarousel();
             loadingIndicator.style.display = 'none';
-            // analyzeButton.disabled = false; // Re-enable button (moved to finally block)
+            
+            // Check the content type of the response
+            const contentType = response.headers.get('content-type');
+            if (!contentType || !contentType.includes('application/json')) {
+                throw new Error(`Expected JSON response but got ${contentType || 'unknown content type'}`);
+            }
 
-            const data = await response.json();
+            let data;
+            try {
+                data = await response.json();
+            } catch (jsonError) {
+                console.error("JSON parsing error:", jsonError);
+                throw new Error(`Failed to parse server response as JSON. Status: ${response.status}`);
+            }
 
             if (!response.ok) {
                 const errorMessage = data && data.error ? data.error : `Server error: ${response.status}`;
                 showError(errorMessage);
-                // Button re-enabled in finally block
                 return;
             }
 
@@ -167,13 +191,12 @@ document.addEventListener('DOMContentLoaded', () => {
                 // This case means response was OK, but no error and no analysis_text
                 showError('Received an empty analysis from the server.');
             }
-
         } catch (error) {
-            // Error handling remains the same
+            // Stop loading indicators
             stopCarousel();
             loadingIndicator.style.display = 'none';
             console.error('Error during analysis:', error);
-            showError('An unexpected client-side error occurred. Please check the console or try again.');
+            showError(`An error occurred: ${error.message || 'Unknown error'}`);
         } finally {
             // Ensure the button is always re-enabled after fetch completes or fails
             analyzeButton.disabled = false; 

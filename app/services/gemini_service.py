@@ -4,6 +4,8 @@ import google.generativeai as genai
 import gc  # For garbage collection
 import functools
 import time
+import signal
+from contextlib import contextmanager
 
 # Configure Gemini API Key
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
@@ -11,6 +13,25 @@ if not GEMINI_API_KEY:
     logging.warning("Warning: GEMINI_API_KEY environment variable not set.")
 else:
     genai.configure(api_key=GEMINI_API_KEY)
+
+# Class to handle timeout exceptions
+class TimeoutException(Exception):
+    pass
+
+# Context manager for timeouts
+@contextmanager
+def time_limit(seconds):
+    def signal_handler(signum, frame):
+        raise TimeoutException("Timed out!")
+    
+    # Set the timeout handler
+    signal.signal(signal.SIGALRM, signal_handler)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        # Reset the alarm
+        signal.alarm(0)
 
 # Retry decorator for API calls
 def retry_api_call(max_retries=3, backoff_factor=1.0):
@@ -28,9 +49,39 @@ def retry_api_call(max_retries=3, backoff_factor=1.0):
                     logging.warning(f"API call failed, retrying ({retries}/{max_retries}): {e}")
                     # Exponential backoff
                     time.sleep(backoff_factor * (2 ** (retries - 1)))
+                    # Force garbage collection before retry
+                    gc.collect()
             return None  # Should never reach here
         return wrapper
     return decorator
+
+def chunk_text(text, max_chunk_size=25000):
+    """
+    Split text into manageable chunks to prevent memory issues.
+    For transcripts, we'll create logical breaks at speaker changes.
+    """
+    if len(text) <= max_chunk_size:
+        return [text]
+    
+    chunks = []
+    lines = text.split('\n')
+    current_chunk = []
+    current_size = 0
+    
+    for line in lines:
+        line_size = len(line) + 1  # +1 for the newline
+        if current_size + line_size > max_chunk_size and current_chunk:
+            chunks.append('\n'.join(current_chunk))
+            current_chunk = [line]
+            current_size = line_size
+        else:
+            current_chunk.append(line)
+            current_size += line_size
+    
+    if current_chunk:
+        chunks.append('\n'.join(current_chunk))
+    
+    return chunks
 
 @retry_api_call(max_retries=2)
 def analyze_transcript(transcript, sales_rep_names, merchant_names):
@@ -50,6 +101,13 @@ def analyze_transcript(transcript, sales_rep_names, merchant_names):
         if not GEMINI_API_KEY:
             logging.error("Gemini API key not configured.")
             return {'error': 'AI service not configured. API key is missing.'}
+
+        # Hard limit transcript size to prevent memory issues
+        max_transcript_length = 30000  # Characters
+        if len(transcript) > max_transcript_length:
+            truncated_transcript = transcript[:max_transcript_length] + "\n...[transcript truncated due to length limits]"
+            logging.warning(f"Transcript truncated from {len(transcript)} to {len(truncated_transcript)} characters")
+            transcript = truncated_transcript
 
         # Construct the prompt for Gemini, keeping everything else the same
         prompt = f"""# Funnel‑Coach‑Gem v1‑2025‑05‑21 (Rev 7)‑explore‑100pt (Explore‑stage calls)
@@ -115,208 +173,6 @@ A **successful (complete) funnel** = **Thinking ➜ Explore ➜ ≥ 1 Narrow/Con
 
 ---
 
-## 4 Scoring rubric (0 – 100 pts) — Strictly deterministic. Points are awarded only when criteria are demonstrably and fully met as per the definitions. Failure to meet a criterion results in zero points for that specific item, ensuring that poor performance is accurately reflected in a lower score.
-
-| Category                 | Criteria                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Points                                      |
-| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------- |
-| **Question type & flow** | **(Total 30 pts)** (See Point Calculation in Section 4.2 for detailed scoring logic)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | **(Total 30 pts)**                          |
-|                          | ≥ 1 **Thinking** question asked by rep anywhere in the call                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | **+5**                                      |
-|                          | ≥ 1 **Explore** (broad) question asked by rep anywhere in the call                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | **+5**                                      |
-|                          | ≥ 1 **Narrow / Confirm** question asked by rep anywhere in the call                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | **+5**                                      |
-|                          | ≥ 1 **Sweeper** question or summarising statement asked by rep anywhere in the call                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | **+5**                                      |
-|                          | Funnel order compliance: **All** funnels initiated by a Thinking question from the rep must strictly follow the Thinking ➜ Explore ➜ Narrow/Confirm order. (Order: Next rep question in funnel is Explore, then ≥1 Narrow/Confirm in that funnel). If any funnel breaks this order, 0 pts.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | **+10**                                     |
-| **Funnel execution**     | **(Total 20 pts)** (See Point Calculation in Section 4.2 for detailed scoring logic)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | **(Total 20 pts)**                          |
-|                          | Each complete funnel (defined as a rep‑initiated Thinking question ➜ followed by ≥1 rep Explore question ➜ followed by ≥1 rep Narrow/Confirm question, all within the same identified funnel) scores +10 points. This applies to funnels anywhere in the call.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | **+10 ea** (max 2 funnels, so 20 pts total) |
-| **Pain discovery**       | **(Total 15 pts)** The goal here is to differentiate between merely identifying a problem and truly understanding its business implications.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | **(Total 15 pts)**                          |
-|                          | **Tier 1: Problem Acknowledged & Confirmed by Rep**  Criteria to Meet Tier 1 for +10 pts:  (a) Prospect Articulates a Problem: The prospect explicitly states a specific problem, challenge, point of friction, or dissatisfaction they are currently experiencing (e.g., "Our current software is too slow," "We're missing deadlines," "It's hard to get accurate data").  (b) Rep Confirms Understanding: Within the Rep's next **3 sales‑rep turns** (merchant turns do not count) within the same funnel, the Rep acknowledges the stated problem, often by rephrasing or summarising it (e.g., "So, the speed of your current software is a concern," "Okay, so missed deadlines are an issue you're facing"). Simple acknowledgements like 'I see,' 'Okay,' 'Got it,' 'Makes sense' do NOT count as a qualifying restatement or clarification for these points.  (c) Relevance: The identified problem is in an area where your product/service could potentially offer a solution. | **+10**                                     |
-|                          | **Tier 2: Impact Explored - First Instance of Probing & Articulation**  Criteria to Meet for +2.5 pts (must meet all Tier 1 criteria for this pain first):  (a) Probing for Consequences: The rep asks questions to uncover the effects or results of the Tier 1 problem (e.g., "What happens as a result of that manual data entry?", "How does that increased churn affect your overall business goals?", "Can you give me an example of how that data inaccuracy has impacted a decision?").  (b) AND Prospect Articulates Impact: The prospect describes specific negative outcomes. These could be: Operational (Wasted time, inefficiencies), Financial (Increased costs, lost revenue), Strategic (Inability to meet goals, competitive disadvantage), Team/Personal (Frustration, low morale).  (c) AND Clear Link Between Problem and Impact: The conversation clearly connects the initially stated problem to these broader business consequences.                              | **+2.5**                                    |
-|                          | **Tier 2: Impact Explored - Second Instance OR Quantification/Qualification**  Criteria to Meet for +2.5 pts (must meet all Tier 1 criteria for the respective pain(s) first): EITHER:  (a) The Rep successfully explores impact (Rep probes & Prospect articulates specific negative outcomes with a clear link, as defined above) for a second, different Tier 1 pain.  (b) OR For a previously explored impact (where criteria (a) and (b) of the first Tier 2 instance were met), the Rep guides the prospect to provide some measure of the impact (Quantification/Qualification) or establish its scale/urgency (e.g., Prospect: "...Last month, this actually led to us overstocking a product line, costing us about £10,000," or "It costs us about 10 hours per employee per week," or "This is a top priority for our VP to solve this quarter").  (Cumulative max +5 for Tier 2 impact exploration across all pains).                                                          | **+2.5** (cumulative max +5 for depth)      |
-| **Motivation probing**   | **(Total 10 pts)** A "good score" here means the rep has gone beyond the "what's wrong" (pain) to understand the "why act" and "what's the desired future state."                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | **(Total 10 pts)**                          |
-|                          | **Core Business Objectives & Desired Future State Identified**  Criteria for +4 pts: The Rep successfully:  (a) Identifies Core Business Objectives/Goals: Uncovers specific, strategic business goals or objectives that the prospect's organization is trying to achieve (e.g., "increase market share," "reduce operational costs by X%," "improve customer retention by Y points").  (b) AND Understands Desired Outcomes/Future State: Helps the prospect paint a picture of the positive future state once the pains are resolved and motivations are addressed.                                                                                                                                                                                                                                                                                                                                                                                                                     | **+4**                                      |
-|                          | **Link Between Pain Resolution & Objectives OR Urgency Explored**  Criteria for +3 pts: For an identified objective/future state, the Rep successfully EITHER:  (a) Links Pain Resolution to Achieving Objectives: The conversation clearly connects solving the identified pain(s) directly to the attainment of these broader business objectives or the realisation of a desired future state.  (b) OR Uncovers Compelling Reasons to Act (Urgency/Priority): Explores why this is important now.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | **+3**                                      |
-|                          | **Comprehensive Understanding Confirmed OR Personal Wins Explored (Tactfully)**  Criteria for +3 pts: The Rep EITHER:  (a) Confirmation and Validation: Summarises their understanding of the motivations and desired outcomes, and the prospect confirms this understanding.  (b) OR (Bonus/If appropriate and (a) is covered) Identifies Personal Wins: If confirmation is robust, tactfully uncovers what achieving these outcomes means for the key individual(s) personally (e.g., recognition, reduced stress, ability to focus on more strategic work, career advancement).                                                                                                                                                                                                                                                                                                                                                                                                         | **+3** (cumulative max +6 for depth)        |
-| **Commitment**           |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | **(Total 15 pts)**                          |
-|                          | Specific commitment requested                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | **+7**                                      |
-|                          | Commitment explicitly agreed by Merchant (unconditional). **Conditional or tentative language** ('if', 'might', 'need to check', 'subject to') **does NOT qualify** for these points.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | **+8**                                      |
-| **Call wrap‑up**         | Component Scoring (Total 10 pts):                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | **(Total 10 pts)**                          |
-|                          | Rep explicitly states at least one specific, actionable next step for the Sales Rep.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | **+3**                                      |
-|                          | Rep explicitly states at least one specific, actionable next step for the Merchant (if appropriate for the situation).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | **+3**                                      |
-|                          | Rep provides a specific, concrete timeframe (e.g., 'by end of day Tuesday,' 'within 24 hours,' 'next week on Thursday') for at least one of the key next actions discussed.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | **+4**                                      |
-
-Total Score: Sum of all earned points. Max possible score = 100.
-
-> **Transparency Tip** – Note the exact point contribution of each criterion in the *Category breakdown* so reps see where they won or lost points. For example, for Call wrap‑up, show points earned for each component if not all are met (e.g., 6/10 if timeframe is missing).
-
-**Interpretation bands**
-
-* **95‑100** = Exceptional
-* **80‑94** = Strong
-* **65‑79** = Solid
-* **50‑64** = Needs Improvement
-* **0‑49** = Major Coaching Required
-
-## 4.1  Few-Shot Examples for Question Classification (Apply these strictly)
-
-These examples illustrate how to classify questions based on context.
-
-**Example 1: Meeting Introduction Silence**
-
-Scenario: You are in the Introduction of the meeting and there is a two-second silence.
-Recommended Rep Question: "What would you like to achieve during our meeting today?"
-Classification: Thinking.
-Rationale for LLM: This question is broad, open-ended, and designed to provoke reflection on goals for the meeting, fitting the definition of a Thinking question. It's suitable for starting a discussion or a new funnel.
-
-**Example 2: Merchant States a "Big Fraud Problem"**
-
-Merchant Statement: "We have a big fraud problem."
-Rep Question Option A: "How do you define big?"
-Classification A: Explore.
-Rationale A for LLM: This question directly seeks to understand the specifics and scope of the stated "trigger" (the fraud problem). It drills deeper into the merchant's statement.
-
-Rep Question Option B: "How is this affecting your resource capacity?"
-Classification B: Thinking.
-Rationale B for LLM: This question aims to broaden the understanding of the problem's impact and provokes wider reflection beyond just the definition of "big." It could initiate a new line of inquiry or funnel.
-
-Guidance for LLM: When a merchant statement could lead to multiple valid question types, analyze the Rep's chosen question. If it directly seeks more detail about the specifics of the trigger, classify as Explore. If it seeks to understand broader implications, consequences, or provokes wider reflection, classify as Thinking.
-
-**Example 3: Merchant States Potential Revenue Gain**
-
-Merchant Statement: "If you can make us an extra $1m sales revenue per year through higher Acceptance Rates, this is great!"
-Rep Question Option A: "How would you re-invest this money?"
-Classification A: Thinking.
-Rationale A for LLM: This is a broad, open-ended question designed to make the merchant reflect on the wider implications and value of the stated benefit.
-
-Rep Question Option B: "If we can evidence this increase with a similar merchant, would you give us a share of wallet?"
-Classification B: Narrow/Confirm. (Also relates to Commitment).
-Rationale B for LLM: This is a narrow, yes/no style question aimed at confirming a specific condition and potentially securing a soft commitment.
-
-**Example 4: Merchant States Team Size**
-
-Merchant Statement: "We have a payments team of 5 people here."
-Rep Question: "What does the team focus most of their time on?"
-Classification: Explore.
-Rationale for LLM: This question seeks to learn more about the topic (the payments team) introduced by the merchant, fitting the Explore definition.
-
-**Example 5: Merchant Summarises a Pain at Funnel End**
-
-Merchant Statement: "So ultimately our lack of APMs is costing us sales."
-Rep Question: "So if we can help you to offer a greater range of APMs, we will be helping you to enhance sales revenue?"
-Classification: Narrow/Confirm.
-Rationale for LLM: The rep is rephrasing the merchant's summary of the pain into a question to validate understanding, fitting the Narrow/Confirm definition.
-
----
-
-## 4.2 Structured analysis procedure (MUST follow in order)
-
-1. **Role check** – Confirm sales‑rep vs merchant roles were provided; if unclear, trigger `NEED_SPEAKER_ROLES` and halt.
-2. **Utterance list** – Iterate through the transcript top‑to‑bottom, extracting only **sales‑rep** utterances (ignore merchant lines except for identifying merchant‑stated pains, motivations, or commitment agreements). Number rep utterances sequentially (R1, R2, R3...).
-3. **Question tagging** – For each rep utterance:
-
-   * Classify it as **Thinking**, **Explore**, **Narrow/Confirm**, **Sweeper**, or **Other** (e.g., statement, transition, rapport‑building) strictly applying the definitions in Section 2 and logic from Few‑Shot Examples. Apply the one‑question‑one‑category rule and the first‑question‑only rule for multi‑question utterances.
-4. **Funnel grouping** – Create a new funnel (F1, F2, …) every time you identify a **Thinking** question from the rep. Assign all subsequent rep Explore → Narrow/Confirm → Sweeper questions to that funnel **until** the next Thinking question or end of transcript.
-5. **Insights capture (per funnel)** – Consistently focus on these three pillars for each funnel:
-
-   * **Pains** – What is the Merchant's PAIN? (See Tier 1 definition for qualifying articulation).
-   * **Motivations** – What is driving the merchant? (See Motivation criteria).
-   * **Commitment** – What COMMITMENTS were sought and obtained? Note if merely requested or explicitly accepted.
-6. **Missed Opportunity Identification (for feedback, not scoring)** – Identify and list any instances where the merchant expresses a pain or motivation and the rep asks **no follow‑up question within their next 3 sales‑rep turns** *unless* one of those turns is answering a direct merchant question unrelated to the pain/motivation. These go in "Missed Opportunities".
-7. **Point calculation** –
-
-   * Add points exactly as defined in the Scoring rubric.
-   * **Question type & flow (Total 30 pts)**:
-
-     * Presence of question types (up to +20 pts) awarded as before.
-     * Funnel order compliance (+10 pts):
-
-       1. Evaluate **every** funnel Fi.
-       2. If Fi has Thinking ➜ Explore ➜ ≥1 Narrow/Confirm in that order, Fi passes; else whole criterion fails.
-       3. Award +10 only if **all** funnels pass. Any single failure yields 0 for this criterion.
-   * **Funnel execution (Total up to 20 pts)**: unchanged except now all funnels considered.
-   * Other categories – unchanged.
-   * **Rounding**: Only Motivation‑probing and Pain‑discovery depth can introduce 0.5 values. Round the **final total** half‑up to the nearest integer after capping at 100.
-8. **Band assignment** – Map the final numeric score to its interpretation band.
-9. **Output assembly** – Populate funnel summaries, aggregate lists, score header, category breakdown, and coaching tips exactly as per the template.
-10. **Consistency check** – Verify totals and uniqueness of question classification.
-
----
-
-## 5 Output format (plain text – no JSON)
-
-*Number each funnel chronologically as **F1, F2, …** based on its Thinking question. Tag every question, pain, motivation, commitment, and missed opportunity with its funnel identifier where applicable.*
-
-```
-Final Score: 88/100  (Strong)
-
-Category breakdown:
-• Question type & flow  –  25/30
-• Funnel execution      –  20/20
-• Pain discovery        –  12.5/15
-• Motivation probing    –  7/10
-• Commitment            –  15/15
-• Call wrap‑up          –  7/10  (e.g., Rep step + Merchant step, but no timeframe)
-
-Funnel summaries:
-### F1 (Points earned for execution: +10)
-- Thinking: "How has your current process for X been impacting your team's efficiency?"
-- Explore: "What are the main challenges you've faced with that?"
-- Narrow / Confirm: "So, if you had a system that automated X, that would save you roughly 10 hours a week, is that right?"
-- Narrow / Confirm (Pain Tier 2 Impact): "And is that 10-hour saving something that would significantly impact other project timelines?"
-- Pains: "We're losing a lot of time on manual data entry for X." (Merchant - Tier 1 Pain)
-- Pains: "This means our reports are always late, impacting decisions." (Merchant - Tier 2 Impact)
-- Motivations: "We need to free up our team to focus on more strategic tasks." (Merchant - Core Motivation/Desired Outcome)
-- Commitment: "Yes, sending over the proposal by EOD sounds good." (Merchant agreement to Rep request)
-
-### F2 (Points earned for execution: +10)
-- Thinking: "Why is addressing Y a priority for you now?"
-- Explore: "Who else is involved in feeling the impact of Y?"
-- Narrow / Confirm: "Is the main goal here to reduce costs associated with Y by Q3?" (Links Pain to Objective/Urgency)
-- Additional Question (Motivation Link/Urgency): "When you mention hitting growth targets, how directly does solving Y contribute to that specific goal?"
-- Pains: "The current solution for Y is too expensive and inflexible." (Merchant - Tier 1 Pain)
-- Motivations: "We have a new budget cycle starting and need to show cost savings. Hitting growth targets is paramount." (Merchant - Core Objective & Urgency)
-- Commitment: "A follow-up meeting next Tuesday with Sarah would be great." (Merchant agreement)
-
-Aggregate lists (tagged):
-
-Thinking questions:
-• (F1) "How has your current process for X been impacting your team's efficiency?"
-• (F2) "Why is addressing Y a priority for you now?"
-
-Explore questions:
-• (F1) "What are the main challenges you've faced with that?"
-• (F2) "Who else is involved in feeling the impact of Y?"
-
-Narrow / Confirm questions:
-• (F1) "So, if you had a system that automated X, that would save you roughly 10 hours a week, is that right?"
-• (F1) "And is that 10-hour saving something that would significantly impact other project timelines?"
-• (F2) "Is the main goal here to reduce costs associated with Y by Q3?"
-
-Sweeper questions / statements:
-• (General) "Before we wrap up, was there anything else you hoped to cover today?"
-
-Pain points identified:
-• (F1) Tier 1: "We're losing a lot of time on manual data entry for X."
-• (F1) Tier 2 Impact: "This means our reports are always late, impacting decisions."
-• (F2) Tier 1: "The current solution for Y is too expensive and inflexible."
-
-Motivations uncovered:
-• (F1) Core Motivation/Desired Outcome: "We need to free up our team to focus on more strategic tasks."
-• (F2) Core Objective & Urgency: "We have a new budget cycle starting and need to show cost savings. Hitting growth targets is paramount."
-
-Commitments obtained:
-• (F1) Rep requested proposal review, Merchant agreed: "Yes, sending over the proposal by EOD sounds good."
-• (F2) Rep requested follow-up meeting, Merchant agreed: "A follow-up meeting next Tuesday with Sarah would be great."
-
-Missed Opportunities (for feedback only):
-• (F1) Merchant mentioned "integrating with our CRM is a nightmare" (Potential Tier 1 Pain) but Rep did not ask a follow-up question in the next 2 turns to confirm or explore impact.
-
-Coaching tips:
-Great job on executing two complete funnels (F1, F2) and securing clear commitments! For instance, in F1, when the merchant stated the pain "We're losing a lot of time on manual data entry for X," you effectively confirmed it and then explored the impact by asking about the 10-hour saving's effect on timelines, earning Tier 1 and Tier 2 points. One area for improvement: in F1, when the merchant mentioned "integrating with our CRM is a nightmare," this was a missed opportunity to explore that pain further according to Tier 1 criteria. Consider asking, "Could you tell me more about the CRM integration challenges?" to acknowledge and understand that specific problem. In the call wrap-up, you clearly stated next steps for both yourself and the merchant, earning 6 points. To get the full 10 points next time, ensure you also provide a specific timeframe for one of those key actions. For motivation probing in F2, you successfully uncovered core objectives ("hitting growth targets") and urgency ("new budget cycle"). To further strengthen, ensure you always try to get explicit confirmation of your summarized understanding of all motivations, as per the criteria.
-```
-
-*Use headings and bullet points exactly as shown above; do **not** output JSON or any other machine‑readable markup.*
-
----
-
 ## 6 Style rules
 
 * Quote all utterances verbatim in bullet lists.
@@ -343,8 +199,13 @@ Merchant(s) indicated as: {merchant_names}
 ```
 
 ## ANALYSIS AND EVALUATION:
-(Begin your analysis here, following all rules and formatting specified above)
+(Begin your analysis here, focusing only on identifying the basic question types and funnels. Due to space constraints, provide a simplified analysis with these key elements:)
+1. Identify the main question types (Thinking, Explore, Narrow/Confirm, Sweeper)
+2. Find complete funnels following the Thinking → Explore → Narrow/Confirm pattern
+3. Note any significant pains articulated by the merchant
+4. Provide a brief score estimation
 
+Keep your response concise and under 2000 words.
 """
 
         # Use a more optimized model configuration with lower temperature for memory efficiency
@@ -352,28 +213,48 @@ Merchant(s) indicated as: {merchant_names}
                                     generation_config=genai.GenerationConfig(
                                         temperature=0,
                                         top_p=0.1,
-                                        max_output_tokens=10000  # Limit output size
+                                        max_output_tokens=5000  # Reduced output size
                                     ))
         
-        # Make the API call with retry
+        # Make the API call with retry and timeout protection
         try:
-            response = model.generate_content(prompt)
+            # Set a timeout for the entire operation
+            with time_limit(60):  # 60 second timeout
+                # Force garbage collection before API call
+                gc.collect()
+                response = model.generate_content(prompt)
+                # Force garbage collection immediately after API call
+                gc.collect()
+        except TimeoutException:
+            logging.error("Gemini API call timed out after 60 seconds")
+            return {'error': 'Analysis timed out. Please try with a shorter transcript.'}
         except Exception as e:
             logging.error(f"First API call failed, retrying: {e}")
             # Clean up memory before retrying
             gc.collect()
             # Retry with a shorter prompt if needed
-            if len(transcript) > 50000:
-                transcript = transcript[:50000] + "\n...[transcript truncated due to length]"
+            if len(transcript) > 15000:
+                transcript = transcript[:15000] + "\n...[transcript truncated due to length]"
                 prompt = prompt.replace("{transcript}", transcript)
             # Try again with a delay
             time.sleep(1)
-            response = model.generate_content(prompt)
+            
+            try:
+                with time_limit(60):  # 60 second timeout for retry
+                    response = model.generate_content(prompt)
+                    gc.collect()
+            except TimeoutException:
+                logging.error("Retry API call also timed out")
+                return {'error': 'Analysis timed out. Please try again with a much shorter transcript.'}
         
         # Force garbage collection to free memory
         gc.collect()
         
         # Handle specific error responses
+        if not hasattr(response, 'text'):
+            logging.error(f"Gemini API returned an empty or malformed response: {response}")
+            return {'error': 'AI service returned an empty response. Please try again with a shorter transcript.'}
+            
         if response.text == "NEED_SPEAKER_ROLES: Please specify which speaker(s) is/are the sales rep(s) and which is/are the merchant(s) so I can evaluate the call.":
             return {'analysis_text': response.text, 'is_error': True}
         elif response.text == "DATA_NOT_REDACTED":
@@ -382,7 +263,7 @@ Merchant(s) indicated as: {merchant_names}
             return {'analysis_text': response.text, 'is_error': True}
         
         # Check for empty response
-        if not hasattr(response, 'text') or not response.text:
+        if not response.text or not response.text.strip():
             logging.error(f"Gemini API returned an empty or malformed response: {response}")
             prompt_feedback_msg = ""
             if hasattr(response, 'prompt_feedback') and response.prompt_feedback and hasattr(response.prompt_feedback, 'block_reason'):
